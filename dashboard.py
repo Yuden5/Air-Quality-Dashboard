@@ -41,7 +41,7 @@ DISTRICTS = {
 selected_district_name = st.sidebar.radio("Select District", list(DISTRICTS.keys()), label_visibility="collapsed")
 selected_station_query = DISTRICTS[selected_district_name]
 
-AQICN_TOKEN = "849c8b3cfa716b53710985357bf0834f100f9980"
+AQICN_TOKEN = st.secrets["AQICN_TOKEN"]
 
 # 3. Fetch Live Telemetry Data across all districts
 @st.cache_data(ttl=300)
