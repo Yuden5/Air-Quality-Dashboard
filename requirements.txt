@@ -1,5 +1,6 @@
 streamlit
 pandas
-requests
+azure-storage-blob
+streamlit-autorefresh
 folium
 streamlit-folium
