@@ -4,3 +4,4 @@ azure-storage-blob
 streamlit-autorefresh
 folium
 streamlit-folium
+plotly
