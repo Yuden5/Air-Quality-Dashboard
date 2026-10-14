@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="https://geoether-air-quality-dashboard.streamlit.app">
+  <a href="https://air-quality-dashboard-dsa-441.streamlit.app">
     <img src="https://img.shields.io/badge/Live%20Demo-Visit%20GeoEther-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white" alt="Live Demo">
   </a>
 </p>
