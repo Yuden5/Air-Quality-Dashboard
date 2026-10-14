@@ -1,21 +1,18 @@
 """
-GeoEther IoT telemetry simulator
-Sends simulated temperature, humidity, and air-quality readings to Azure IoT Hub.
+GeoEther IoT telemetry simulator (Multi-Device Version)
+Sends simulated temperature, humidity, and air-quality readings from 
+multiple devices to Azure IoT Hub concurrently.
 
 Install:
     python -m pip install azure-iot-device
 
 Run:
     python iot_simulator.py
-
-When prompted, paste the DEVICE connection string from:
-Azure Portal -> IoT Hub -> Devices -> your device -> Primary connection string.
-The connection string is entered privately and is not saved to this file.
-Press Ctrl+C to stop.
 """
 
 import json
 import random
+import threading
 import time
 from datetime import datetime, timezone
 from getpass import getpass
@@ -23,19 +20,12 @@ from getpass import getpass
 from azure.iot.device import IoTHubDeviceClient, Message
 
 SEND_INTERVAL_SECONDS = 5
+NUM_DEVICES = 4
 
 
-def main():
-    print("GeoEther IoT telemetry simulator")
-    print("Paste your IoT DEVICE connection string when prompted.")
-    print("It will not be displayed or saved in this script.\n")
-
-    connection_string = getpass("Device connection string: ").strip()
-    if not connection_string:
-        print("No connection string entered. Exiting.")
-        return
-
-    device_id = "geoether-device"
+def simulate_device(device_index, connection_string):
+    """Worker function to run telemetry simulation for a single device connection string."""
+    device_id = f"device-{device_index}"
     for part in connection_string.split(";"):
         if part.strip().lower().startswith("deviceid="):
             device_id = part.split("=", 1)[1].strip()
@@ -44,10 +34,8 @@ def main():
     client = None
     try:
         client = IoTHubDeviceClient.create_from_connection_string(connection_string)
-        print("\nConnecting to Azure IoT Hub...")
         client.connect()
-        print(f"Connected. Sending telemetry every {SEND_INTERVAL_SECONDS} seconds.")
-        print("Press Ctrl+C to stop.\n")
+        print(f"[{device_id}] Connected and sending telemetry every {SEND_INTERVAL_SECONDS}s.")
 
         while True:
             payload = {
@@ -64,25 +52,48 @@ def main():
 
             try:
                 client.send_message(message)
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Sent: {json.dumps(payload)}")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] [{device_id}] Sent: {json.dumps(payload)}")
             except Exception as exc:
-                print(f"Send failed: {type(exc).__name__}: {exc}")
-                print("Check the device connection string and IoT Hub connectivity.")
+                print(f"[{device_id}] Send failed: {type(exc).__name__}: {exc}")
 
             time.sleep(SEND_INTERVAL_SECONDS)
 
-    except KeyboardInterrupt:
-        print("\nStopping simulator...")
     except Exception as exc:
-        print(f"\nSimulator error: {type(exc).__name__}: {exc}")
-        print("Confirm you used the DEVICE connection string (not the IoT Hub owner/service connection string).")
+        print(f"[{device_id}] Simulator error: {type(exc).__name__}: {exc}")
     finally:
         if client is not None:
             try:
                 client.shutdown()
             except Exception:
                 pass
-        print("Simulator stopped.")
+        print(f"[{device_id}] Stopped.")
+
+
+def main():
+    print("GeoEther IoT Multi-Device Telemetry Simulator")
+    print(f"You will be prompted to enter connection strings for {NUM_DEVICES} separate devices.\n")
+
+    connection_strings = []
+    for i in range(1, NUM_DEVICES + 1):
+        conn_str = getpass(f"Device {i} connection string: ").strip()
+        if not conn_str:
+            print("Empty connection string entered. Stopping setup.")
+            return
+        connection_strings.append(conn_str)
+
+    print(f"\nStarting {NUM_DEVICES} device threads. Press Ctrl+C to stop.\n")
+
+    threads = []
+    for idx, conn_str in enumerate(connection_strings, start=1):
+        t = threading.Thread(target=simulate_device, args=(idx, conn_str), daemon=True)
+        t.start()
+        threads.append(t)
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nStopping all simulators...")
 
 
 if __name__ == "__main__":

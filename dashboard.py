@@ -1,1937 +1,582 @@
 import json
-
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-import folium
-
+import plotly.express as px
 
 from azure.storage.blob import BlobServiceClient
 from streamlit_autorefresh import st_autorefresh
-from streamlit_folium import st_folium
-
-
 
 # ------------------------------------------------------------
 # 1. Page configuration
 # ------------------------------------------------------------
-
-
 st.set_page_config(
-    page_title="GeoEther | Azure Air Quality Monitoring",
+    page_title="GeoEther | Air Quality Intelligence",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",   # navigation and filters now live in the page itself
 )
 
+# Refresh every 60 seconds. New readings require the Azure pipeline to be running.
+st_autorefresh(interval=60_000, key="azure_telemetry_autorefresh")
 
-# Refresh every 60 seconds.
-# New readings require the Azure pipeline to be running.
-st_autorefresh(
-    interval=60_000,
-    key="azure_telemetry_autorefresh",
-)
+# ------------------------------------------------------------
+# 2. Theme
+# ------------------------------------------------------------
+INK, MUTED, GRID = "#17233C", "#6B7689", "#E6EAF1"
+ACCENT = "#2F6BFF"
+PURPLE, GREEN, AMBER, RED, BLUE = "#625DF5", "#16B887", "#E9A23B", "#E35D6A", "#3397E8"
+CHART_FONT = "Poppins, DM Sans, sans-serif"
+
+# Device colours are deliberately distinct from the status colours (green / amber / red)
+# so a device colour is never mistaken for a status.
+DEVICE_COLORS = ["#2563EB", "#7C3AED", "#0891B2", "#C026D3", "#475569",
+                 "#4F46E5", "#0D9488", "#BE185D", "#65A30D", "#1E3A8A"]
+
+# Background of the "System status" KPI card for each state.
+STATUS_TONE = {"NORMAL": "#12B76A", "WARNING": "#F5A524", "ALERT": "#FF6B1A", "NO DATA": "#98A2B3"}
+
+AQ_NORMAL, AQ_ALERT, AQ_HIGH = 50, 100, 80   # demo thresholds
+
+# Feather icons (MIT licence) used inside the KPI badges and the top bar.
+ICON_PATHS = {
+    "wind": '<path d="M9.59 4.59A2 2 0 1 1 11 8H2m10.59 11.41A2 2 0 1 0 14 16H2m15.73-8.27A2.5 2.5 0 1 1 19.5 12H2"/>',
+    "thermometer": '<path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/>',
+    "droplet": '<path d="M12 2.69l5.66 5.66a8 8 0 1 1-11.31 0z"/>',
+    "cpu": '<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/>'
+           '<path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/>',
+    "activity": '<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>',
+}
+LOGO = ('<svg viewBox="0 0 24 24" width="26" height="26"><path d="M12 2l9 5v10l-9 5-9-5V7z" fill="#2F6BFF"/>'
+        '<path d="M12 7l4.5 2.5v5L12 17l-4.5-2.5v-5z" fill="#fff"/></svg>')
 
 
-# Load existing CSS.
-try:
-    with open("style.css", encoding="utf-8") as css_file:
-        st.markdown(
-            f"<style>{css_file.read()}</style>",
-            unsafe_allow_html=True,
-        )
-except FileNotFoundError:
-    pass
+def load_css(filename: str = "style.css") -> None:
+    try:
+        css = Path(__file__).with_name(filename).read_text(encoding="utf-8")
+        st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+    except OSError:
+        st.warning(f"Stylesheet '{filename}' not found next to the app file.")
 
+
+load_css()
+
+REQUIRED_COLUMNS = ["device_id", "temperature", "humidity", "air_quality", "event_time"]
+OPTIONAL_COLUMNS = ["location", "city", "device_name"]
+ALL_COLUMNS = REQUIRED_COLUMNS + OPTIONAL_COLUMNS
 
 
 # ------------------------------------------------------------
-# 2. Azure telemetry configuration
+# 3. Data loading
 # ------------------------------------------------------------
-
-
-REQUIRED_COLUMNS = [
-    "device_id",
-    "temperature",
-    "humidity",
-    "air_quality",
-    "event_time",
-]
-
-
-
 def parse_blob_content(content: str) -> list[dict]:
-    """Read a JSON object, array, or line-separated JSON records."""
-
-
     content = content.strip()
-
-
     if not content:
         return []
-
-
     try:
         parsed = json.loads(content)
-
-
         if isinstance(parsed, list):
-            return [
-                item for item in parsed
-                if isinstance(item, dict)
-            ]
-
-
+            return [x for x in parsed if isinstance(x, dict)]
         if isinstance(parsed, dict):
             return [parsed]
-
-
     except json.JSONDecodeError:
         pass
-
-
     records = []
-
-
     for line in content.splitlines():
-        line = line.strip()
-
-
-        if not line:
-            continue
-
-
         try:
-            item = json.loads(line)
-
-
+            item = json.loads(line.strip())
             if isinstance(item, dict):
                 records.append(item)
-
-
-        except json.JSONDecodeError:
-            # Ignore invalid or incomplete JSON lines.
+        except (json.JSONDecodeError, TypeError):
             continue
-
-
     return records
 
 
-
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_azure_telemetry() -> tuple[pd.DataFrame, str | None]:
-    """Read recent JSON telemetry blobs from Azure Blob Storage."""
-
-
+@st.cache_data(ttl=55, show_spinner=False)
+def fetch_azure_telemetry() -> tuple[pd.DataFrame, str | None, int]:
+    """Load recent JSON blobs from the existing Azure Blob Storage configuration."""
     try:
-        connection_string = st.secrets[
-            "AZURE_STORAGE_CONNECTION_STRING"
-        ]
-
-
-        container_name = st.secrets[
-            "AZURE_CONTAINER_NAME"
-        ]
-
-
-        prefix = st.secrets.get(
-            "AZURE_BLOB_PREFIX",
-            "",
-        )
-
-
-        service = BlobServiceClient.from_connection_string(
-            connection_string
-        )
-
-
-        container = service.get_container_client(
-            container_name
-        )
-
-
-        # List JSON blobs in the configured container.
-        json_blobs = [
-            blob
-            for blob in container.list_blobs(
-                name_starts_with=prefix or None
-            )
-            if blob.name.lower().endswith(".json")
-        ]
-
-
-        # Newest modified blobs first.
-        json_blobs.sort(
-            key=lambda blob: (
-                blob.last_modified
-                or pd.Timestamp.min.tz_localize("UTC")
-            ),
-            reverse=True,
-        )
-
-
+        connection_string = st.secrets["AZURE_STORAGE_CONNECTION_STRING"]
+        container_name = st.secrets["AZURE_CONTAINER_NAME"]
+        prefix = st.secrets.get("AZURE_BLOB_PREFIX", "")
+        service = BlobServiceClient.from_connection_string(connection_string)
+        container = service.get_container_client(container_name)
+        blobs = [b for b in container.list_blobs(name_starts_with=prefix or None)
+                 if b.name.lower().endswith(".json")]
+        blobs.sort(key=lambda b: b.last_modified or pd.Timestamp.min.tz_localize("UTC"), reverse=True)
         records = []
-
-
-        # Download only the 20 newest JSON blobs.
-        for blob in json_blobs[:20]:
+        for blob in blobs[:30]:
             try:
-                raw = container.download_blob(
-                    blob.name
-                ).readall()
-
-
-                content = raw.decode("utf-8-sig")
-
-
-                records.extend(
-                    parse_blob_content(content)
-                )
-
-
+                records.extend(parse_blob_content(
+                    container.download_blob(blob.name).readall().decode("utf-8-sig")))
             except Exception:
-                # Continue if an individual blob cannot be read.
                 continue
-
-
         if not records:
-            return (
-                pd.DataFrame(columns=REQUIRED_COLUMNS),
-                None,
-            )
-
-
-        df = pd.DataFrame(records)
-
-
-        # Missing fields remain missing.
-        # No synthetic readings are created.
-        for column in REQUIRED_COLUMNS:
-            if column not in df.columns:
-                df[column] = pd.NA
-
-
-        df = df[REQUIRED_COLUMNS].copy()
-
-
-        df["device_id"] = df["device_id"].astype("string")
-
-
-        for column in [
-            "temperature",
-            "humidity",
-            "air_quality",
-        ]:
-            df[column] = pd.to_numeric(
-                df[column],
-                errors="coerce",
-            )
-
-
-        df["event_time"] = pd.to_datetime(
-            df["event_time"],
-            errors="coerce",
-            utc=True,
-        )
-
-
-        df = df.dropna(
-            subset=["device_id", "event_time"]
-        )
-
-
-        df = df[
-            df["device_id"].str.strip() != ""
-        ]
-
-
-        df = df.drop_duplicates(
-            subset=["device_id", "event_time"],
-            keep="last",
-        )
-
-
-        df = df.sort_values("event_time")
-
-
-        return df, None
-
-
+            return pd.DataFrame(columns=ALL_COLUMNS), None, min(len(blobs), 30)
+        data = pd.DataFrame(records)
+        for col in ALL_COLUMNS:
+            if col not in data.columns:
+                data[col] = pd.NA
+        data = data[ALL_COLUMNS].copy()
+        data["device_id"] = data["device_id"].astype("string")
+        for col in ["temperature", "humidity", "air_quality"]:
+            data[col] = pd.to_numeric(data[col], errors="coerce")
+        data["event_time"] = pd.to_datetime(data["event_time"], errors="coerce", utc=True)
+        data = data.dropna(subset=["device_id", "event_time"])
+        data = data[data["device_id"].str.strip().ne("")]
+        data = data.drop_duplicates(subset=["device_id", "event_time"], keep="last")
+        return data.sort_values("event_time"), None, min(len(blobs), 30)
     except KeyError as exc:
-        return (
-            pd.DataFrame(columns=REQUIRED_COLUMNS),
-            f"Missing Streamlit secret: {exc}. "
-            "Configure your Azure secrets.",
-        )
-
-
+        return pd.DataFrame(columns=ALL_COLUMNS), f"Missing Streamlit secret: {exc}. Configure Azure secrets.", 0
     except Exception as exc:
-        return (
-            pd.DataFrame(columns=REQUIRED_COLUMNS),
-            f"Could not read Azure Blob Storage: {exc}",
-        )
-
-
-
-# Retrieve telemetry using the existing Azure connection.
-df, load_error = fetch_azure_telemetry()
-
+        return pd.DataFrame(columns=ALL_COLUMNS), f"Could not read Azure Blob Storage: {exc}", 0
 
 
 # ------------------------------------------------------------
-# 3. Header
+# 4. Helpers
 # ------------------------------------------------------------
-
-
-st.markdown(
-    """
-    <div class="top-nav">
-        <div class="nav-brand">
-            GeoEther | Air Quality Monitoring System
-        </div>
-        <div>
-            <span class="nav-status">
-                Azure Blob Telemetry
-            </span>
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-st.caption(
-    "Live readings from Azure IoT Hub → Stream Analytics "
-    "→ Blob Storage. The dashboard refreshes every 60 seconds."
-)
-
-
-if load_error:
-    st.error(load_error)
-
-
-
-# ------------------------------------------------------------
-# 4. Dashboard page navigation
-# ------------------------------------------------------------
-
-
-st.sidebar.markdown("### GeoEther")
-
-
-selected_page = st.sidebar.radio(
-    "DASHBOARD PAGES",
-    [
-        "Live Monitoring",
-        "Azure Pipeline & Workflow",
-    ],
-    index=0,
-)
-
-
-st.sidebar.markdown("---")
-
-
-
-# ============================================================
-# PAGE 2: AZURE PIPELINE & WORKFLOW
-# ============================================================
-
-
-if selected_page == "Azure Pipeline & Workflow":
-
-
-    st.title("Azure Pipeline & Workflow")
-
-
-    st.caption(
-        "GeoEther | End-to-end IoT telemetry processing "
-        "and visualization"
-    )
-
-
-    st.markdown("---")
-
-
-    # --------------------------------------------------------
-    # 4.1 End-to-end data pipeline
-    # --------------------------------------------------------
-
-
-    st.subheader("End-to-End Data Pipeline")
-
-
-    st.write(
-        "The following workflow shows how telemetry travels "
-        "from the Python simulator through Azure services "
-        "and into the GeoEther dashboard."
-    )
-
-
-    pipeline_steps = [
-        {
-            "number": "01",
-            "title": "IoT Sensor Simulator",
-            "service": "Python · azure-iot-device",
-            "details": (
-                "Generates sample sensor telemetry containing "
-                "device_id, temperature, humidity, air_quality, "
-                "and event_time. Sends messages at regular intervals."
-            ),
-            "output": "Telemetry messages",
-        },
-        {
-            "number": "02",
-            "title": "Azure IoT Hub",
-            "service": "Device-to-cloud messaging",
-            "details": (
-                "Receives telemetry from the registered IoT device "
-                "through its device connection."
-            ),
-            "output": "Incoming device events",
-        },
-        {
-            "number": "03",
-            "title": "Azure Stream Analytics",
-            "service": "Real-time stream processing",
-            "details": (
-                "Reads events from the IoT Hub input and selects "
-                "the telemetry fields required by GeoEther. "
-                "System.Timestamp() supplies the event-processing "
-                "timestamp used by the query."
-            ),
-            "output": "Structured telemetry records",
-        },
-        {
-            "number": "04",
-            "title": "Azure Blob Storage",
-            "service": "Persistent output storage",
-            "details": (
-                "Receives processed records through the configured "
-                "BlobOutput output alias. JSON blobs store the "
-                "telemetry for subsequent retrieval."
-            ),
-            "output": "JSON blob files",
-        },
-        {
-            "number": "05",
-            "title": "GeoEther Dashboard",
-            "service": "Python · Streamlit",
-            "details": (
-                "Connects to the configured storage container, "
-                "reads recent JSON blobs, parses records, and "
-                "displays KPIs, charts, warning states, insights, "
-                "and the sensor records table."
-            ),
-            "output": "Monitoring and visualization",
-        },
-    ]
-
-
-    for index, step in enumerate(pipeline_steps):
-
-
-        with st.container(border=True):
-
-
-            number_col, details_col = st.columns(
-                [1, 5]
-            )
-
-
-            with number_col:
-                st.markdown(
-                    f"## {step['number']}"
-                )
-
-
-            with details_col:
-                st.markdown(
-                    f"### {step['title']}"
-                )
-
-
-                st.caption(step["service"])
-
-
-                st.write(step["details"])
-
-
-                st.markdown(
-                    f"**Output:** {step['output']}"
-                )
-
-
-        if index < len(pipeline_steps) - 1:
-            st.markdown(
-                """
-                <div style="
-                    text-align:center;
-                    font-size:26px;
-                    color:#718096;
-                    margin:2px 0;
-                ">↓</div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-
-    st.markdown("---")
-
-
-    # --------------------------------------------------------
-    # 4.2 Stream Analytics queries
-    # --------------------------------------------------------
-
-
-    st.subheader("Stream Analytics Queries")
-
-
-    st.write(
-        "These queries read the IoT Hub input and send the "
-        "selected telemetry fields to the configured Blob output."
-    )
-
-
-    query_tab_1, query_tab_2, query_tab_3 = st.tabs(
-        [
-            "1. Base Telemetry Query",
-            "2. Condition-Based Query",
-            "3. Aggregation Query",
-        ]
-    )
-
-
-    with query_tab_1:
-
-
-        st.markdown("#### Base Telemetry Query")
-
-
-        st.write(
-            "This is the existing query. It forwards every "
-            "telemetry event and its required fields to Blob Storage."
-        )
-
-
-        st.code(
-            """SELECT
-    device_id,
-    temperature,
-    humidity,
-    air_quality,
-    System.Timestamp() AS event_time
-INTO
-    BlobOutput
-FROM
-    [thailand-air-iothub]""",
-            language="sql",
-        )
-
-
-    with query_tab_2:
-
-
-        st.markdown("#### Condition-Based Query")
-
-
-        st.write(
-            "This query forwards only events where the air-quality "
-            "value is greater than or equal to 80."
-        )
-
-
-        st.code(
-            """SELECT
-    device_id,
-    temperature,
-    humidity,
-    air_quality,
-    System.Timestamp() AS event_time
-INTO
-    BlobOutput
-FROM
-    [thailand-air-iothub]
-WHERE
-    air_quality >= 80""",
-            language="sql",
-        )
-
-
-        st.caption(
-            "In the Live Monitoring page, the dashboard also shows "
-            "a local view of the records matching this condition."
-        )
-
-
-    with query_tab_3:
-
-
-        st.markdown("#### Aggregation Query")
-
-
-        st.write(
-            "This query groups telemetry by device and one-minute "
-            "tumbling window. It calculates average, maximum, and "
-            "sum of air quality, plus average temperature."
-        )
-
-
-        st.code(
-            """SELECT
-    device_id,
-    AVG(air_quality) AS avg_air_quality,
-    MAX(air_quality) AS max_air_quality,
-    SUM(air_quality) AS sum_air_quality,
-    AVG(temperature) AS avg_temperature
-INTO
-    BlobOutput
-FROM
-    [thailand-air-iothub]
-GROUP BY
-    device_id,
-    TumblingWindow(minute, 1)""",
-            language="sql",
-        )
-
-
-        st.caption(
-            "In the Live Monitoring page, the dashboard also shows "
-            "a local one-minute aggregation view calculated from "
-            "the retrieved Azure telemetry."
-        )
-
-
-    st.caption(
-        "BlobOutput is the Stream Analytics output alias. "
-        "The actual storage container is configured separately."
-    )
-
-
-    st.info(
-        "If you add the condition-based or aggregation query as "
-        "an additional Stream Analytics output, use a separate "
-        "output alias and container or blob prefix. Do not send "
-        "multiple query outputs to the same BlobOutput unless you "
-        "intend to mix record types."
-    )
-
-
-    st.markdown("---")
-
-
-    # --------------------------------------------------------
-    # 4.3 Telemetry data schema
-    # --------------------------------------------------------
-
-
-    st.subheader("Telemetry Data Schema")
-
-
-    schema_df = pd.DataFrame(
-        [
-            {
-                "Field": "device_id",
-                "Purpose": "Identifies the sending device",
-                "Dashboard Use": (
-                    "Device filtering and record identification"
-                ),
-            },
-            {
-                "Field": "temperature",
-                "Purpose": (
-                    "Temperature value supplied by the simulator"
-                ),
-                "Dashboard Use": (
-                    "Temperature KPI, trend, and thresholds"
-                ),
-            },
-            {
-                "Field": "humidity",
-                "Purpose": (
-                    "Humidity value supplied by the simulator"
-                ),
-                "Dashboard Use": (
-                    "Humidity KPI and sensor insights"
-                ),
-            },
-            {
-                "Field": "air_quality",
-                "Purpose": (
-                    "Air-quality value supplied by the simulator"
-                ),
-                "Dashboard Use": (
-                    "Air-quality KPI, trend, thresholds, "
-                    "condition filtering, and aggregation"
-                ),
-            },
-            {
-                "Field": "event_time",
-                "Purpose": (
-                    "Timestamp assigned by Stream Analytics"
-                ),
-                "Dashboard Use": (
-                    "Time-series charts, event ordering, and "
-                    "one-minute aggregation windows"
-                ),
-            },
-        ]
-    )
-
-
-    st.dataframe(
-        schema_df,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
-    st.info(
-        "The current simulator produces sample telemetry. "
-        "The air_quality field is a simulated value, not a direct "
-        "measurement from a certified air-quality instrument."
-    )
-
-
-    st.markdown("---")
-
-
-    # --------------------------------------------------------
-    # 4.4 Dashboard processing workflow
-    # --------------------------------------------------------
-
-
-    st.subheader("Dashboard Data Processing Workflow")
-
-
-    dashboard_steps = [
-        (
-            "1. Authenticate",
-            "Read the Azure Storage connection string and "
-            "container name from Streamlit secrets.",
-        ),
-        (
-            "2. Discover recent files",
-            "List JSON blobs in the configured container and "
-            "sort them by last-modified timestamp.",
-        ),
-        (
-            "3. Retrieve telemetry",
-            "Download up to 20 of the newest JSON blobs and "
-            "parse JSON objects, arrays, or line-separated records.",
-        ),
-        (
-            "4. Validate and prepare",
-            "Convert numeric fields and timestamps, discard "
-            "invalid device/timestamp records, remove duplicate "
-            "device-time records, and sort by event time.",
-        ),
-        (
-            "5. Calculate indicators",
-            "Calculate latest and average values from the records "
-            "retrieved and classify the latest readings using "
-            "the project's configured thresholds.",
-        ),
-        (
-            "6. Apply query views",
-            "Create a condition-based view for air_quality >= 80 "
-            "and a local one-minute aggregation view by device.",
-        ),
-        (
-            "7. Visualize and refresh",
-            "Render KPI cards, time-series charts, rule-based "
-            "insights, query-result sections, the regional map, "
-            "and the records table. The dashboard refreshes every "
-            "60 seconds.",
-        ),
-    ]
-
-
-    for title, description in dashboard_steps:
-
-
-        with st.container(border=True):
-            st.markdown(f"**{title}**")
-            st.write(description)
-
-
-    st.markdown("---")
-
-
-    # --------------------------------------------------------
-    # 4.5 Warning and alert workflow
-    # --------------------------------------------------------
-
-
-    st.subheader("Warning and Alert Workflow")
-
-
-    alert_df = pd.DataFrame(
-        [
-            {
-                "Metric": "Air Quality",
-                "NORMAL": "≤ 50",
-                "WARNING": "51–100",
-                "ALERT": "> 100",
-            },
-            {
-                "Metric": "Temperature",
-                "NORMAL": "< 35 °C",
-                "WARNING": "35–< 40 °C",
-                "ALERT": "≥ 40 °C",
-            },
-        ]
-    )
-
-
-    st.dataframe(
-        alert_df,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
-    st.markdown(
-        """
-        **Decision rule**
-
-
-        - **NORMAL:** Available latest readings are within the
-          configured normal ranges.
-        - **WARNING:** At least one latest reading is in the
-          warning range and none is in the alert range.
-        - **ALERT:** At least one latest reading has reached
-          the alert range.
-        - **NO DATA:** Neither air quality nor temperature has
-          a valid latest reading.
-        """
-    )
-
-
-    st.caption(
-        "These are demonstration thresholds, not official "
-        "environmental or health standards. The dashboard "
-        "classifies readings locally; this code does not configure "
-        "Azure-side alerts."
-    )
-
-
-    st.markdown("---")
-
-
-    # --------------------------------------------------------
-    # 4.6 Azure components and roles
-    # --------------------------------------------------------
-
-
-    st.subheader("Azure Components and Their Roles")
-
-
-    service_df = pd.DataFrame(
-        [
-            {
-                "Component": "Azure IoT Hub",
-                "Role": "Ingests device-to-cloud telemetry",
-            },
-            {
-                "Component": "Azure Stream Analytics",
-                "Role": (
-                    "Processes the event stream, applies the "
-                    "condition filter, and calculates aggregates"
-                ),
-            },
-            {
-                "Component": "Azure Blob Storage",
-                "Role": "Stores processed JSON output",
-            },
-            {
-                "Component": "Streamlit Secrets",
-                "Role": (
-                    "Stores storage connection configuration securely"
-                ),
-            },
-            {
-                "Component": "Streamlit Dashboard",
-                "Role": (
-                    "Reads stored telemetry and displays monitoring UI"
-                ),
-            },
-        ]
-    )
-
-
-    st.dataframe(
-        service_df,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
-    st.warning(
-        "The simulator must be running to generate new messages. "
-        "Stream Analytics must process the messages, and Blob Storage "
-        "must receive output. Refreshing Streamlit alone does not "
-        "create new telemetry."
-    )
-
-
-    st.success(
-        "Workflow overview complete. Select Live Monitoring "
-        "in the sidebar to return to the dashboard."
-    )
-
-
-    # Stop here so the live dashboard sections below are not rendered.
-    st.stop()
-
-
-
-# ============================================================
-# PAGE 1: LIVE MONITORING
-# ============================================================
-
-
-# ------------------------------------------------------------
-# 5. Device filter
-# ------------------------------------------------------------
-
-
-st.sidebar.markdown("### IoT Devices")
-
-
-st.sidebar.caption(
-    "Choose which device telemetry to display."
-)
-
-
-if not df.empty:
-
-
-    device_ids = sorted(
-        df["device_id"].dropna().astype(str).unique().tolist()
-    )
-
-
-    selected_device = st.sidebar.selectbox(
-        "Select device",
-        ["All Devices"] + device_ids,
-        label_visibility="collapsed",
-    )
-
-
-    if selected_device == "All Devices":
-        filtered_df = df.copy()
-    else:
-        filtered_df = df[
-            df["device_id"].astype(str) == selected_device
-        ].copy()
-
-
-else:
-    selected_device = "All Devices"
-    filtered_df = df.copy()
-
-
-
-# ------------------------------------------------------------
-# 6. KPI calculations and warning states
-# ------------------------------------------------------------
-
-
-def latest_value(data: pd.DataFrame, column: str):
-    valid = data.dropna(
-        subset=[column, "event_time"]
-    )
-
-
-    if valid.empty:
-        return None
-
-
-    return valid.sort_values(
-        "event_time"
-    ).iloc[-1][column]
-
-
-
-def average_value(data: pd.DataFrame, column: str):
-    values = data[column].dropna()
-
-
-    if values.empty:
-        return None
-
-
-    return values.mean()
-
-
-
-def metric_text(value, suffix=""):
+def fmt(value, suffix="", digits=1):
     if value is None or pd.isna(value):
         return "—"
+    return f"{value:,.{digits}f}{suffix}"
 
 
-    return f"{value:.1f}{suffix}"
-
-
-
-def air_quality_state(value):
-    if value is None or pd.isna(value):
+def aq_state(v):
+    if v is None or pd.isna(v):
         return "NO DATA"
+    return "NORMAL" if v <= AQ_NORMAL else ("WARNING" if v <= AQ_ALERT else "ALERT")
 
 
-    if value <= 50:
-        return "NORMAL"
-
-
-    if value <= 100:
-        return "WARNING"
-
-
-    return "ALERT"
-
-
-
-def temperature_state(value):
-    if value is None or pd.isna(value):
+def temp_state(v):
+    if v is None or pd.isna(v):
         return "NO DATA"
+    return "NORMAL" if v < 35 else ("WARNING" if v < 40 else "ALERT")
 
 
-    if value < 35:
-        return "NORMAL"
-
-
-    if value < 40:
-        return "WARNING"
-
-
-    return "ALERT"
-
-
-
-def overall_state(air_quality, temperature):
-    states = [
-        air_quality_state(air_quality),
-        temperature_state(temperature),
-    ]
-
-
+def overall_state(aq, temp):
+    states = [aq_state(aq), temp_state(temp)]
     if "ALERT" in states:
         return "ALERT"
-
-
     if "WARNING" in states:
         return "WARNING"
-
-
-    if all(state == "NO DATA" for state in states):
+    if all(x == "NO DATA" for x in states):
         return "NO DATA"
-
-
     return "NORMAL"
 
 
+def state_class(s):
+    return "status-" + s.lower().replace(" ", "-")
 
-latest_air_quality = latest_value(
-    filtered_df,
-    "air_quality",
-)
 
+def icon(name: str) -> str:
+    return ('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+            f'stroke-linecap="round" stroke-linejoin="round">{ICON_PATHS[name]}</svg>')
 
-latest_temp = latest_value(
-    filtered_df,
-    "temperature",
-)
 
-
-latest_humidity = latest_value(
-    filtered_df,
-    "humidity",
-)
-
-
-average_air_quality = average_value(
-    filtered_df,
-    "air_quality",
-)
-
-
-average_temp = average_value(
-    filtered_df,
-    "temperature",
-)
-
-
-last_seen = (
-    filtered_df["event_time"].max()
-    if (
-        not filtered_df.empty
-        and filtered_df["event_time"].notna().any()
-    )
-    else None
-)
-
-
-system_status = overall_state(
-    latest_air_quality,
-    latest_temp,
-)
-
-
-
-# ------------------------------------------------------------
-# 7. KPI cards: two columns per row
-# ------------------------------------------------------------
-
-
-st.subheader("Air Quality Overview")
-
-
-kpi_left, kpi_right = st.columns(
-    2,
-    gap="medium",
-)
-
-
-with kpi_left:
-    st.metric(
-        "Latest Air Quality",
-        metric_text(latest_air_quality),
-    )
-
-
-with kpi_right:
-    st.metric(
-        "Average Air Quality",
-        metric_text(average_air_quality),
-    )
-
-
-
-kpi_left, kpi_right = st.columns(
-    2,
-    gap="medium",
-)
-
-
-with kpi_left:
-    st.metric(
-        "Latest Temperature",
-        metric_text(latest_temp, " °C"),
-    )
-
-
-with kpi_right:
-    st.metric(
-        "Average Temperature",
-        metric_text(average_temp, " °C"),
-    )
-
-
-
-kpi_left, kpi_right = st.columns(
-    2,
-    gap="medium",
-)
-
-
-with kpi_left:
-    st.metric(
-        "Latest Humidity",
-        metric_text(latest_humidity, " %"),
-    )
-
-
-with kpi_right:
-    st.metric(
-        "System Status",
-        system_status,
-    )
-
-
-
-if system_status == "ALERT":
-
-
-    st.error(
-        "ALERT: At least one latest sensor reading has "
-        "crossed the configured alert threshold."
-    )
-
-
-elif system_status == "WARNING":
-
-
-    st.warning(
-        "WARNING: At least one latest sensor reading is "
-        "in the configured warning range."
-    )
-
-
-elif system_status == "NORMAL":
-
-
-    st.success(
-        "NORMAL: Latest available readings are within "
-        "the configured ranges."
-    )
-
-
-else:
-
-
-    st.info(
-        "System status is unavailable until valid sensor "
-        "readings arrive."
-    )
-
-
-
-if last_seen is not None:
-    st.caption(
-        f"Latest event timestamp: "
-        f"{last_seen.strftime('%Y-%m-%d %H:%M:%S UTC')} "
-        f"| Selected device: {selected_device}"
-    )
-
-
-st.markdown("---")
-
-
-
-# ------------------------------------------------------------
-# 8. Sensor trends
-# ------------------------------------------------------------
-
-
-st.subheader("Sensor Trends")
-
-
-trend_left, trend_right = st.columns(2)
-
-
-with trend_left:
-
-
-    st.markdown("#### Air Quality Over Time")
-
-
-    st.caption(
-        "Actual air_quality readings from Azure telemetry."
-    )
-
-
-    air_chart = filtered_df.dropna(
-        subset=["event_time", "air_quality"]
-    ).sort_values("event_time")
-
-
-    if not air_chart.empty:
-
-
-        air_chart = air_chart.set_index(
-            "event_time"
-        )[["air_quality"]]
-
-
-        air_chart = air_chart.rename(
-            columns={
-                "air_quality": "Air Quality",
-            }
-        )
-
-
-        st.line_chart(
-            air_chart,
-            height=320,
-        )
-
-
-    else:
-
-
-        st.info(
-            "No air-quality readings are available yet."
-        )
-
-
-
-with trend_right:
-
-
-    st.markdown("#### Temperature Over Time")
-
-
-    st.caption(
-        "Actual temperature readings from Azure telemetry."
-    )
-
-
-    temp_chart = filtered_df.dropna(
-        subset=["event_time", "temperature"]
-    ).sort_values("event_time")
-
-
-    if not temp_chart.empty:
-
-
-        temp_chart = temp_chart.set_index(
-            "event_time"
-        )[["temperature"]]
-
-
-        temp_chart = temp_chart.rename(
-            columns={
-                "temperature": "Temperature (°C)",
-            }
-        )
-
-
-        st.line_chart(
-            temp_chart,
-            height=320,
-        )
-
-
-    else:
-
-
-        st.info(
-            "No temperature readings are available yet."
-        )
-
-
-st.markdown("---")
-
-
-
-# ------------------------------------------------------------
-# 8.1 Condition-based query view
-# ------------------------------------------------------------
-
-
-st.subheader("Condition-Based Records")
-
-
-st.caption(
-    "Dashboard view of the Stream Analytics condition: "
-    "air_quality >= 80. This uses the telemetry already loaded "
-    "from Azure Blob Storage."
-)
-
-
-condition_df = filtered_df.dropna(
-    subset=["air_quality"]
-).copy()
-
-
-condition_df = condition_df[
-    condition_df["air_quality"] >= 80
-].sort_values(
-    "event_time",
-    ascending=False,
-)
-
-
-condition_left, condition_right = st.columns(
-    [1, 3]
-)
-
-
-with condition_left:
-    st.metric(
-        "Records With Air Quality ≥ 80",
-        len(condition_df),
-    )
-
-
-with condition_right:
-    if not condition_df.empty:
-        st.line_chart(
-            condition_df.set_index("event_time")[
-                ["air_quality"]
-            ].rename(
-                columns={
-                    "air_quality": "Air Quality ≥ 80"
-                }
-            ),
-            height=260,
-        )
-    else:
-        st.info(
-            "No records currently meet the condition "
-            "air_quality >= 80."
-        )
-
-
-if not condition_df.empty:
-
-
-    condition_display_df = condition_df.copy()
-
-
-    condition_display_df["event_time"] = (
-        condition_display_df["event_time"].dt.strftime(
-            "%Y-%m-%d %H:%M:%S UTC"
-        )
-    )
-
-
-    st.dataframe(
-        condition_display_df.head(100),
-        use_container_width=True,
-        hide_index=True,
-        height=280,
-    )
-
-
-    st.caption(
-        "Showing up to 100 matching records from the currently "
-        "loaded Azure telemetry."
-    )
-
-
-else:
-    st.warning(
-        "No condition-based records are available yet."
-    )
-
-
-st.markdown("---")
-
-
-
-# ------------------------------------------------------------
-# 8.2 One-minute aggregation query view
-# ------------------------------------------------------------
-
-
-st.subheader("One-Minute Aggregates by Device")
-
-
-st.caption(
-    "Dashboard view of the Stream Analytics aggregation query: "
-    "records grouped by device and a one-minute tumbling window."
-)
-
-
-aggregation_df = filtered_df.dropna(
-    subset=[
-        "device_id",
-        "event_time",
-        "air_quality",
-    ]
-).copy()
-
-
-if not aggregation_df.empty:
-
-
-    aggregation_df["window_start"] = (
-        aggregation_df["event_time"].dt.floor("1min")
-    )
-
-
-    aggregation_df = aggregation_df.groupby(
-        [
-            "device_id",
-            "window_start",
-        ],
-        as_index=False,
-    ).agg(
-        avg_air_quality=(
-            "air_quality",
-            "mean",
-        ),
-        max_air_quality=(
-            "air_quality",
-            "max",
-        ),
-        sum_air_quality=(
-            "air_quality",
-            "sum",
-        ),
-        avg_temperature=(
-            "temperature",
-            "mean",
-        ),
-    )
-
-
-    aggregation_df = aggregation_df.sort_values(
-        [
-            "window_start",
-            "device_id",
-        ],
-        ascending=[False, True],
-    )
-
-
-    aggregate_left, aggregate_right = st.columns(
-        [1, 2]
-    )
-
-
-    with aggregate_left:
-        st.metric(
-            "Aggregated Windows",
-            len(aggregation_df),
-        )
-
-
-    with aggregate_right:
-        aggregate_chart = aggregation_df.copy()
-
-
-        aggregate_chart["window_start"] = (
-            aggregate_chart[
-                "window_start"
-            ].dt.strftime(
-                "%Y-%m-%d %H:%M"
-            )
-        )
-
-
-        aggregate_chart = aggregate_chart.set_index(
-            "window_start"
-        )[["avg_air_quality"]]
-
-
-        aggregate_chart = aggregate_chart.rename(
-            columns={
-                "avg_air_quality": (
-                    "Average Air Quality"
-                )
-            }
-        )
-
-
-        st.line_chart(
-            aggregate_chart,
-            height=260,
-        )
-
-
-    aggregation_display_df = aggregation_df.copy()
-
-
-    aggregation_display_df["window_start"] = (
-        aggregation_display_df[
-            "window_start"
-        ].dt.strftime(
-            "%Y-%m-%d %H:%M:%S UTC"
-        )
-    )
-
-
-    st.dataframe(
-        aggregation_display_df.head(100),
-        use_container_width=True,
-        hide_index=True,
-        height=320,
-    )
-
-
-    st.caption(
-        "Showing up to 100 most recent one-minute windows from "
-        "the currently loaded Azure telemetry. Average temperature "
-        "is blank for windows without a valid temperature value."
-    )
-
-
-else:
-    st.info(
-        "No valid telemetry is available to calculate "
-        "one-minute aggregates."
-    )
-
-
-st.markdown("---")
-
-
-
-# ------------------------------------------------------------
-# 9. Sensor location map
-# ------------------------------------------------------------
-
-
-st.subheader("Sensor Location Map")
-
-
-st.caption(
-    "Regional map for project context. Current Azure telemetry "
-    "does not include latitude or longitude, so this is not "
-    "a verified live sensor-location map."
-)
-
-
-map_col, map_info_col = st.columns([1.6, 1])
-
-
-with map_col:
-
-
-    # Regional context only; no fabricated sensor coordinates.
-    sensor_map = folium.Map(
-        location=[17.0, 101.0],
-        zoom_start=5,
-        tiles="OpenStreetMap",
-    )
-
-
-    folium.Marker(
-        location=[17.0, 101.0],
-        tooltip="Regional view: Thailand",
-        popup=(
-            "Regional context only. "
-            "No live sensor coordinates are available."
-        ),
-        icon=folium.Icon(
-            color="blue",
-            icon="info-sign",
-        ),
-    ).add_to(sensor_map)
-
-
-    st_folium(
-        sensor_map,
-        height=420,
-        use_container_width=True,
-        key="geoether_regional_map",
-    )
-
-
-
-with map_info_col:
-
-
-    st.markdown("#### Location Data")
-
-
-    st.write(
-        "**Selected device:**",
-        selected_device,
-    )
-
-
-    if last_seen is not None:
-
-
-        st.write(
-            "**Last recorded event:**",
-            last_seen.strftime("%Y-%m-%d %H:%M:%S UTC"),
-        )
-
-
-    else:
-
-
-        st.write(
-            "**Last recorded event:** No data"
-        )
-
-
-    st.info(
-        "To display real sensor markers, telemetry must include "
-        "valid latitude and longitude fields, and the dashboard "
-        "must retain those fields when loading the records."
-    )
-
-
-st.markdown("---")
-
-
-
-# ------------------------------------------------------------
-# 10. Smart sensor insights
-# ------------------------------------------------------------
-
-
-st.subheader("Smart Sensor Insights")
-
-
-st.caption(
-    "Rule-based interpretation of actual readings. "
-    "No generative AI model is connected in this version."
-)
-
-
-insight_col, threshold_col = st.columns([1.2, 1])
-
-
-with insight_col:
-
-
-    st.markdown("#### Current Interpretation")
-
-
-    if filtered_df.empty:
-
-
-        st.info(
-            "No sensor records are available for interpretation. "
-            "Check the Azure telemetry pipeline."
-        )
-
-
-    else:
-
-
-        if (
-            latest_air_quality is not None
-            and not pd.isna(latest_air_quality)
-        ):
-
-
-            aq_state = air_quality_state(
-                latest_air_quality
-            )
-
-
-            if aq_state == "NORMAL":
-
-
-                st.success(
-                    f"Air quality value is "
-                    f"{latest_air_quality:.1f}, within the "
-                    "project's normal range."
-                )
-
-
-            elif aq_state == "WARNING":
-
-
-                st.warning(
-                    f"Air quality value is "
-                    f"{latest_air_quality:.1f}, within the "
-                    "project's warning range."
-                )
-
-
-            else:
-
-
-                st.error(
-                    f"Air quality value is "
-                    f"{latest_air_quality:.1f}, above the "
-                    "project's warning range."
-                )
-
-
-        else:
-
-
-            st.info(
-                "No valid air-quality value is available."
-            )
-
-
-
-        if (
-            latest_temp is not None
-            and not pd.isna(latest_temp)
-        ):
-
-
-            temp_state = temperature_state(
-                latest_temp
-            )
-
-
-            if temp_state == "NORMAL":
-
-
-                st.success(
-                    f"Temperature is {latest_temp:.1f} °C, "
-                    "within the project's normal range."
-                )
-
-
-            elif temp_state == "WARNING":
-
-
-                st.warning(
-                    f"Temperature is {latest_temp:.1f} °C, "
-                    "within the project's warning range."
-                )
-
-
-            else:
-
-
-                st.error(
-                    f"Temperature is {latest_temp:.1f} °C, "
-                    "at or above the project's alert threshold."
-                )
-
-
-        else:
-
-
-            st.info(
-                "No valid temperature value is available."
-            )
-
-
-
-        if (
-            latest_humidity is not None
-            and not pd.isna(latest_humidity)
-        ):
-
-
-            st.write(
-                f"Latest recorded humidity: "
-                f"{latest_humidity:.1f}%."
-            )
-
-
-        else:
-
-
-            st.write(
-                "Humidity data is not available."
-            )
-
-
-
-with threshold_col:
-
-
-    st.markdown("#### Project Alert Thresholds")
-
-
-    threshold_df = pd.DataFrame(
-        [
-            {
-                "Metric": "Air Quality",
-                "NORMAL": "≤ 50",
-                "WARNING": "51–100",
-                "ALERT": "> 100",
-            },
-            {
-                "Metric": "Temperature",
-                "NORMAL": "< 35 °C",
-                "WARNING": "35–< 40 °C",
-                "ALERT": "≥ 40 °C",
-            },
-        ]
-    )
-
-
-    st.dataframe(
-        threshold_df,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
-    st.caption(
-        "These are demonstration thresholds for this project, "
-        "not official health or environmental safety standards. "
-        "The air_quality field is supplied by the simulator."
-    )
-
-
-st.markdown("---")
-
-
-
-# ------------------------------------------------------------
-# 11. Latest sensor records
-# ------------------------------------------------------------
-
-
-st.subheader("Latest Sensor Records")
-
-
-if not filtered_df.empty:
-
-
-    display_df = filtered_df.sort_values(
-        "event_time",
-        ascending=False,
-    ).copy()
-
-
-    display_df["event_time"] = (
-        display_df["event_time"].dt.strftime(
-            "%Y-%m-%d %H:%M:%S UTC"
-        )
-    )
-
-
-    st.dataframe(
-        display_df.head(100),
-        use_container_width=True,
-        hide_index=True,
-        height=350,
-    )
-
-
-    st.caption(
-        "Records loaded from the 20 most recently modified "
-        "JSON blobs. The dashboard displays values from Azure "
-        "telemetry and does not generate missing readings."
-    )
-
-
-else:
-
-
-    st.warning(
-        "No Azure telemetry records found. Check the container "
-        "name, Streamlit secrets, Stream Analytics output, "
-        "and simulator."
-    )
-
-
-
-# ------------------------------------------------------------
-# 12. Troubleshooting and data notes
-# ------------------------------------------------------------
-
-
-with st.expander("Troubleshooting and Data Notes"):
-
-
+def kpi(label, value, note, icon_name, variant="", tone=None, value_class=""):
+    """KPI card. variant: '' (white), 'primary' (accent fill) or 'status' (fill follows system status)."""
+    style = f' style="--tone:{tone}"' if tone else ""
     st.markdown(
-        """
-        - **No records:** Confirm that Stream Analytics is running
-          and writing JSON files to the configured Blob Storage container.
+        f'<div class="kpi {variant}"{style}>'
+        f'<div class="kpi-top"><div class="kpi-label">{label}</div>'
+        f'<span class="kpi-icon">{icon(icon_name)}</span></div>'
+        f'<div class="kpi-value {value_class}">{value}</div><div class="kpi-note">{note}</div></div>',
+        unsafe_allow_html=True)
 
 
-        - **No new readings:** The simulator, IoT Hub input,
-          Stream Analytics job, and Blob output must all be working.
+def heading(title, note=""):
+    st.markdown(f'<div class="section-title">{title}</div><div class="section-note">{note}</div>',
+                unsafe_allow_html=True)
 
 
-        - **Missing values:** Confirm that the output contains
-          `device_id`, `temperature`, `humidity`, `air_quality`,
-          and `event_time`.
+def card(key: str):
+    """Light panel that holds a chart or table (styled in style.css via the key-based class)."""
+    return st.container(key=f"card-{key}")
 
 
-        - **Old readings:** Check the newest blob's Last modified
-          time in Azure Portal.
+def panel(key: str, title: str, note: str = ""):
+    """Section title above a panel, as in the reference design."""
+    heading(title, note)
+    return card(key)
 
 
-        - **Condition-based records:** These records require a valid
-          `air_quality` value of 80 or greater.
-
-
-        - **One-minute aggregates:** These are calculated locally
-          from loaded telemetry using device and one-minute windows.
-          They mirror the Stream Analytics aggregation query but are
-          not a replacement for Azure-side aggregation output.
-
-
-        - **Map:** The current telemetry schema does not contain
-          latitude or longitude, so the map is regional context only.
-
-
-        - **Smart insights:** Current interpretations use explicit
-          thresholds. No generative AI service is connected here.
-
-
-        - **Security:** Keep the Azure Storage connection string in
-          Streamlit Secrets and never commit it to your repository.
-        """
+def style_plot(fig, height=280, unified=True):
+    fig.update_layout(
+        height=height, margin=dict(l=4, r=4, t=8, b=4), showlegend=False,
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family=CHART_FONT, color=INK, size=11),
+        hovermode="x unified" if unified else "closest",
+        hoverlabel=dict(bgcolor="white", font_size=12),
     )
+    fig.update_xaxes(title=None, showgrid=False, zeroline=False, linecolor=GRID)
+    fig.update_yaxes(title=None, showgrid=True, gridcolor="#E4E9F1", zeroline=False)
+    return fig
+
+
+def show(fig):
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
+def build_registry(data):
+    """One stable colour + label + place per device, used by every chart and the legend."""
+    registry, used = {}, set()
+    if data.empty:
+        return registry
+    latest = data.sort_values("event_time").groupby("device_id").tail(1).sort_values("device_id")
+    for i, (_, r) in enumerate(latest.iterrows()):
+        did = str(r["device_id"])
+        name = str(r["device_name"]).strip() if pd.notna(r["device_name"]) and str(r["device_name"]).strip() else did
+        if name in used:
+            name = f"{name} ({did})"
+        used.add(name)
+        place = next((str(r[c]) for c in ["location", "city"] if pd.notna(r[c]) and str(r[c]).strip()), "")
+        registry[did] = {"label": name, "place": place, "color": DEVICE_COLORS[i % len(DEVICE_COLORS)]}
+    return registry
+
+
+def header_html(title, subtitle, pill=""):
+    return (f'<div class="page-title">{title}</div>'
+            f'<div class="subtitle">{subtitle}{pill}</div>')
+
+
+# ------------------------------------------------------------
+# 5. Load data and device registry
+# ------------------------------------------------------------
+df, load_error, blob_count = fetch_azure_telemetry()
+REGISTRY = build_registry(df)
+COLOR_MAP = {v["label"]: v["color"] for v in REGISTRY.values()}
+df["label"] = df["device_id"].astype(str).map({k: v["label"] for k, v in REGISTRY.items()})
+devices = sorted(df["device_id"].dropna().astype(str).unique().tolist())
+
+if load_error:
+    PILL = '<span class="pill bad"><i></i>Connection needs attention</span>'
+elif df.empty:
+    PILL = '<span class="pill wait"><i></i>Connected, awaiting records</span>'
+else:
+    PILL = '<span class="pill ok"><i></i>Azure Blob Storage · refreshes every 60 s</span>'
+
+# ------------------------------------------------------------
+# 6. Top navigation bar
+# ------------------------------------------------------------
+with st.container(key="topbar"):
+    nav_brand, nav_tabs, nav_meta = st.columns([1.2, 2, 1.2], vertical_alignment="center")
+    with nav_brand:
+        st.markdown(f'<div class="nav-brand">{LOGO}<span>GEOETHER</span></div>', unsafe_allow_html=True)
+    with nav_tabs:
+        page = st.radio("Workspace", ["Dashboard", "Azure Pipeline"], horizontal=True,
+                        label_visibility="collapsed")
+    with nav_meta:
+        st.markdown('<div class="nav-meta"><span>DSA</span><b>441</b></div>', unsafe_allow_html=True)
+
+# ------------------------------------------------------------
+# 7. Page: Azure pipeline & workflow
+# ------------------------------------------------------------
+if page == "Azure Pipeline":
+    st.markdown(header_html("Azure Pipeline & Workflow",
+                            "How telemetry moves from IoT devices to the live monitoring experience.", PILL),
+                unsafe_allow_html=True)
+    st.write("")
+    stages = [
+        ("1", "IoT devices", "Python simulator / registered sensors", "Temperature, humidity, air quality, timestamp", PURPLE, "#EDEBFF"),
+        ("2", "Azure IoT Hub", "Device-to-cloud ingestion", "Receives device telemetry", BLUE, "#E1F5FF"),
+        ("3", "Stream Analytics", "Streaming query and routing", "Selects, filters or aggregates events", GREEN, "#E1FAF1"),
+        ("4", "Blob Storage", "JSON persistence", "Stores processed telemetry", AMBER, "#FFF3D9"),
+        ("5", "GeoEther dashboard", "Streamlit visualization", "Loads blobs, computes views, renders insights", RED, "#FCE7EC")]
+    cols = st.columns(5, gap="small")
+    for col, (num, title, sub, detail, color, tint) in zip(cols, stages):
+        with col:
+            st.markdown(
+                f'<div class="kpi" style="min-height:190px"><span class="badge" style="background:{tint};color:{color}">{num}</span>'
+                f'<div style="font-weight:700;margin:.3rem 0 .5rem;color:{INK}">{title}</div>'
+                f'<div style="font-size:.76rem;color:{color};font-weight:600">{sub}</div>'
+                f'<div class="kpi-note" style="margin-top:.6rem">{detail}</div></div>', unsafe_allow_html=True)
+    st.write("")
+    c1, c2, c3, c4 = st.columns(4)
+    latest_event = df["event_time"].max().strftime("%d %b, %H:%M UTC") if not df.empty else "—"
+    for col, label, value in zip(
+            [c1, c2, c3, c4],
+            ["Records loaded", "JSON blobs scanned", "Devices detected", "Latest event"],
+            [f"{len(df):,}", f"{blob_count:,}", f"{len(devices):,}", latest_event]):
+        with col:
+            st.markdown(f'<div class="kpi" style="min-height:90px"><div class="kpi-label">{label}</div>'
+                        f'<div class="kpi-value" style="font-size:1.35rem;margin-top:.3rem">{value}</div></div>',
+                        unsafe_allow_html=True)
+    st.markdown("### Stream Analytics query patterns")
+    t1, t2, t3 = st.tabs(["Base telemetry", "Condition filter", "One-minute aggregate"])
+    with t1:
+        st.caption("Forwards each event's core fields to Blob Storage.")
+        st.code("""SELECT device_id, temperature, humidity, air_quality,
+       System.Timestamp() AS event_time
+INTO BlobOutput
+FROM [thailand-air-iothub]""", language="sql")
+    with t2:
+        st.caption("Example condition: air_quality ≥ 80. The dashboard also derives a local view from loaded base telemetry.")
+        st.code("""SELECT device_id, temperature, humidity, air_quality,
+       System.Timestamp() AS event_time
+INTO ConditionOutput
+FROM [thailand-air-iothub]
+WHERE air_quality >= 80""", language="sql")
+    with t3:
+        st.caption("Groups incoming events by device and one-minute tumbling window.")
+        st.code("""SELECT device_id, AVG(air_quality) AS avg_air_quality,
+       MAX(air_quality) AS max_air_quality,
+       AVG(temperature) AS avg_temperature
+INTO AggregateOutput
+FROM [thailand-air-iothub]
+GROUP BY device_id, TumblingWindow(minute, 1)""", language="sql")
+    st.info("The monitoring page calculates condition and one-minute aggregate views locally from loaded base telemetry. "
+            "If you configure dedicated Azure outputs, keep their schemas or blob prefixes separate to avoid mixing record types.")
+    with st.expander("Schema, thresholds & operating notes"):
+        st.markdown("""- **Required fields:** `device_id`, `temperature`, `humidity`, `air_quality`, `event_time`.
+- **Optional label fields:** `location`, `city`, `device_name`. They only change how devices are named in the legend and records table.
+- **Refresh:** reads recent JSON blobs every 60 seconds; refreshing does not generate telemetry.
+- **Demo thresholds:** air quality ≤ 50 normal, 51–100 warning, > 100 alert; temperature < 35°C normal, 35–<40°C warning, ≥40°C alert. These are not official health or environmental standards.
+- **Security:** keep the Azure Storage connection string in Streamlit Secrets, never in source control.""")
+    st.stop()
+
+# ------------------------------------------------------------
+# 8. Page: Live monitoring
+# ------------------------------------------------------------
+head_left, head_right = st.columns([5, 1], vertical_alignment="center")
+with head_left:
+    st.markdown(header_html("Air Quality Monitoring Dashboard",
+                            "Recent readings, trends and device health", PILL), unsafe_allow_html=True)
+
+selected = devices
+with head_right:
+    if devices:
+        with st.popover("Filter"):
+            selected = st.multiselect(
+                "Devices", devices, default=devices,
+                format_func=lambda d: REGISTRY[d]["label"],
+                help="KPIs, charts, insights and records follow this filter.")
+
+st.write("")
+if load_error:
+    st.error(load_error)
+if df.empty:
+    st.warning("No telemetry loaded. Check Azure secrets, the Blob Storage container, Stream Analytics output, and the device simulator.")
+    st.stop()
+if not selected:
+    st.info("Select at least one device in the Filter menu.")
+    st.stop()
+
+data = df[df["device_id"].astype(str).isin(selected)].copy()
+latest_devices = data.sort_values("event_time").groupby("device_id", as_index=False).tail(1)
+last_seen = data["event_time"].max()
+
+# Network-level values are the average of each device's latest reading
+aq_now = latest_devices["air_quality"].mean()
+temp_now = latest_devices["temperature"].mean()
+hum_now = latest_devices["humidity"].mean()
+aq_peak = data["air_quality"].max()
+
+device_states = [overall_state(r["air_quality"], r["temperature"]) for _, r in latest_devices.iterrows()]
+if "ALERT" in device_states:
+    status = "ALERT"
+elif "WARNING" in device_states:
+    status = "WARNING"
+elif device_states and all(x == "NO DATA" for x in device_states):
+    status = "NO DATA"
+else:
+    status = "NORMAL"
+
+# ---- KPIs ----
+cols = st.columns(5, gap="medium")
+with cols[0]:
+    kpi("Air quality", fmt(aq_now, digits=0), f"Average of latest readings · peak {fmt(aq_peak, digits=0)}",
+        "wind", "primary", ACCENT)
+with cols[1]:
+    kpi("Temperature", fmt(temp_now, " °C"), f"Period average {fmt(data['temperature'].mean(), ' °C')}", "thermometer")
+with cols[2]:
+    kpi("Humidity", fmt(hum_now, " %"), f"Period average {fmt(data['humidity'].mean(), ' %')}", "droplet",
+        value_class="accent")
+with cols[3]:
+    kpi("Devices", f"{len(selected)} / {len(devices)}", f"{len(data):,} readings loaded", "cpu")
+with cols[4]:
+    kpi("System status", status.title(), f"Updated {last_seen.strftime('%H:%M:%S')} UTC", "activity",
+        "status", STATUS_TONE[status])
+
+# ---- Device legend (colours match every chart; dimmed = filtered out) ----
+latest_all = df.sort_values("event_time").groupby("device_id").tail(1).sort_values("device_id")
+chips = []
+for _, r in latest_all.iterrows():
+    did = str(r["device_id"])
+    info = REGISTRY[did]
+    dim = "" if did in selected else " dim"
+    chips.append(f'<div class="chip{dim}"><span class="chip-dot" style="background:{info["color"]}"></span>'
+                 f'<span class="chip-name">{info["label"]}</span><b>{fmt(r["air_quality"], digits=0)}</b></div>')
+st.markdown(f'<div class="chips">{"".join(chips)}</div>', unsafe_allow_html=True)
+
+# ---- Row 1: air quality trend + latest by device ----
+left, right = st.columns([1.6, 1], gap="large")
+with left:
+    with panel("aq-trend", "Air quality over time",
+               "Shaded bands show normal (≤ 50), warning (≤ 100) and alert (> 100) ranges."):
+        chart = data.dropna(subset=["air_quality"]).sort_values("event_time")
+        if not chart.empty:
+            top = max(120.0, float(chart["air_quality"].max()) * 1.1)
+            fig = px.line(chart, x="event_time", y="air_quality", color="label", color_discrete_map=COLOR_MAP)
+            fig.update_traces(line=dict(width=2))
+            for lo, hi, col, name in [(0, AQ_NORMAL, GREEN, "Normal"), (AQ_NORMAL, AQ_ALERT, AMBER, "Warning"), (AQ_ALERT, top, RED, "Alert")]:
+                fig.add_hrect(y0=lo, y1=hi, fillcolor=col, opacity=.07, line_width=0, layer="below",
+                              annotation_text=name, annotation_position="top left",
+                              annotation_font=dict(size=10, color=col))
+            fig.update_yaxes(range=[0, top])
+            show(style_plot(fig, 300))
+        else:
+            st.info("No air-quality readings for this filter.")
+with right:
+    with panel("aq-latest", "Latest air quality by device", "Dotted lines mark 50 and 100."):
+        lat = latest_devices.dropna(subset=["air_quality"]).sort_values("air_quality")
+        if not lat.empty:
+            fig = px.bar(lat, x="air_quality", y="label", orientation="h", color="label",
+                         color_discrete_map=COLOR_MAP, text_auto=".0f")
+            fig.update_traces(textposition="outside", cliponaxis=False)
+            for x in (AQ_NORMAL, AQ_ALERT):
+                fig.add_vline(x=x, line_dash="dot", line_color="#A0AEC0")
+            fig.update_xaxes(range=[0, max(120.0, float(lat["air_quality"].max()) * 1.15)],
+                             showgrid=False)
+            fig.update_yaxes(showgrid=False)
+            show(style_plot(fig, 300, unified=False))
+        else:
+            st.info("No air-quality readings for this filter.")
+
+st.write("")
+
+# ---- Row 2: temperature + humidity ----
+left, right = st.columns(2, gap="large")
+with left:
+    with panel("temp", "Temperature", "Degrees Celsius · dotted lines mark 35 °C (warning) and 40 °C (alert)."):
+        chart = data.dropna(subset=["temperature"]).sort_values("event_time")
+        if not chart.empty:
+            tmin, tmax = float(chart["temperature"].min()), float(chart["temperature"].max())
+            hi = max(tmax + 2, 36.0)
+            fig = px.line(chart, x="event_time", y="temperature", color="label", color_discrete_map=COLOR_MAP)
+            fig.update_traces(line=dict(width=2))
+            fig.add_hline(y=35, line_dash="dot", line_color=AMBER)
+            if hi >= 40:
+                fig.add_hline(y=40, line_dash="dot", line_color=RED)
+            fig.update_yaxes(range=[min(tmin - 2, 34.0), hi])
+            show(style_plot(fig, 260))
+        else:
+            st.info("No temperature readings for this filter.")
+with right:
+    with panel("humidity", "Humidity", "Relative humidity in percent."):
+        chart = data.dropna(subset=["humidity"]).sort_values("event_time")
+        if not chart.empty:
+            fig = px.line(chart, x="event_time", y="humidity", color="label", color_discrete_map=COLOR_MAP)
+            fig.update_traces(line=dict(width=2))
+            fig.update_yaxes(range=[max(0.0, float(chart["humidity"].min()) - 5),
+                                    min(100.0, float(chart["humidity"].max()) + 5)])
+            show(style_plot(fig, 260))
+        else:
+            st.info("No humidity readings for this filter.")
+
+st.write("")
+
+# ---- Local condition + one-minute aggregation ----
+condition = data.dropna(subset=["air_quality"]).query(f"air_quality >= {AQ_HIGH}").sort_values("event_time", ascending=False).copy()
+agg_source = data.dropna(subset=["device_id", "event_time", "air_quality"]).copy()
+if not agg_source.empty:
+    agg_source["window_start"] = agg_source["event_time"].dt.floor("1min")
+    aggregation = (agg_source.groupby(["device_id", "label", "window_start"], as_index=False)
+                   .agg(avg_air_quality=("air_quality", "mean"), max_air_quality=("air_quality", "max"),
+                        avg_temperature=("temperature", "mean"), readings=("air_quality", "count"))
+                   .sort_values("window_start"))
+else:
+    aggregation = pd.DataFrame()
+
+# ---- Row 3: exceedances + one-minute averages ----
+left, right = st.columns([1, 1.4], gap="large")
+with left:
+    with panel("exceed", "High-reading share by device",
+               f"Share of readings at or above {AQ_HIGH} · {len(condition):,} of {len(data):,} readings overall."):
+        valid = data.dropna(subset=["air_quality"])
+        if not valid.empty:
+            exc = (valid.assign(hit=valid["air_quality"] >= AQ_HIGH)
+                   .groupby("label", as_index=False).agg(hits=("hit", "sum"), total=("hit", "size")))
+            exc["share"] = exc["hits"] / exc["total"] * 100
+            exc["text"] = exc.apply(lambda r: f"{r['share']:.0f}%  ({int(r['hits'])} of {int(r['total'])})", axis=1)
+            fig = px.bar(exc.sort_values("share"), x="share", y="label", orientation="h", color="label",
+                         color_discrete_map=COLOR_MAP, text="text")
+            fig.update_traces(textposition="outside", cliponaxis=False)
+            fig.update_xaxes(range=[0, max(15.0, float(exc["share"].max()) * 1.6)], showgrid=False, ticksuffix="%")
+            fig.update_yaxes(showgrid=False)
+            show(style_plot(fig, 260, unified=False))
+        else:
+            st.info("No air-quality readings for this filter.")
+with right:
+    with panel("agg", "One-minute average air quality",
+               f"Last 30 windows per device · dotted line marks the {AQ_HIGH} condition threshold."):
+        if not aggregation.empty:
+            recent = aggregation.groupby("device_id").tail(30)
+            fig = px.line(recent, x="window_start", y="avg_air_quality", color="label", markers=True,
+                          color_discrete_map=COLOR_MAP,
+                          hover_data={"max_air_quality": ":.1f", "readings": True})
+            fig.update_traces(line=dict(width=2), marker=dict(size=5))
+            fig.add_hline(y=AQ_HIGH, line_dash="dot", line_color=RED)
+            show(style_plot(fig, 260))
+        else:
+            st.info("No valid telemetry for one-minute aggregation.")
+
+st.write("")
+
+# ---- Insights (rule-based) ----
+if status == "ALERT":
+    insight1 = ("Alert", "Alert-level reading", "At least one latest air-quality or temperature value crossed the alert threshold.", RED)
+elif status == "WARNING":
+    insight1 = ("Warning", "Review warning readings", "At least one latest value is within a warning range.", AMBER)
+elif status == "NORMAL":
+    insight1 = ("Normal", "Readings within range", "Latest air-quality and temperature readings are below warning thresholds.", GREEN)
+else:
+    insight1 = ("No data", "Insufficient readings", "Valid air-quality and temperature values are not available.", MUTED)
+
+if not condition.empty:
+    row = condition.iloc[0]
+    insight2 = ("High readings", f"{len(condition)} record(s) at or above {AQ_HIGH}",
+                f"Most recent: {row['label']} at {row['event_time'].strftime('%d %b %H:%M UTC')}, air quality {row['air_quality']:.1f}.", RED)
+else:
+    insight2 = ("Clear", "No high-condition records", f"No loaded reading reaches {AQ_HIGH} in this filter.", GREEN)
+
+age = (pd.Timestamp.now(tz="UTC") - last_seen).total_seconds() / 60 if pd.notna(last_seen) else None
+if age is None:
+    insight3 = ("No data", "Freshness unavailable", "No valid event timestamp is available.", MUTED)
+elif age <= 3:
+    insight3 = ("Fresh", "Telemetry looks recent", f"Newest event is about {max(age, 0):.1f} minute(s) old.", GREEN)
+else:
+    insight3 = ("Stale", "Check telemetry freshness", f"Newest event is about {age:.0f} minutes old. Confirm the simulator and Azure outputs.", AMBER)
+
+# ---- Row 4: attention points (full width, one column per insight) ----
+with panel("insights", "Attention points", "Rule-based reading of the selected telemetry."):
+    insight_cols = st.columns(3, gap="medium")
+    for col, (tag, title, body, color) in zip(insight_cols, [insight1, insight2, insight3]):
+        with col:
+            st.markdown(f'<div class="insight"><div class="insight-tag" style="color:{color}">{tag}</div>'
+                        f'<b>{title}</b><p>{body}</p></div>', unsafe_allow_html=True)
+    st.caption("Demo thresholds, not official environmental or medical standards. Air quality may be simulated.")
+
+st.write("")
+
+# ---- Records table ----
+with panel("records", "Latest Sensor Records", "Most recent events first, filtered to the selected devices."):
+    limit = st.selectbox("Rows to display", [25, 50, 100, 250], index=1, label_visibility="collapsed")
+    records = data.sort_values("event_time", ascending=False).head(limit).copy()
+    records["event_time"] = records["event_time"].dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    records = records.rename(columns={"label": "Device", "device_id": "Device ID", "location": "Location", "city": "City",
+                                      "temperature": "Temperature (°C)", "humidity": "Humidity (%)",
+                                      "air_quality": "Air quality", "event_time": "Event time"})
+    visible = [c for c in ["Event time", "Device", "Device ID", "Location", "City", "Air quality",
+                           "Temperature (°C)", "Humidity (%)"]
+               if c in records.columns and records[c].notna().any()]
+    st.dataframe(records[visible], use_container_width=True, hide_index=True, height=340)
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        st.download_button("Export CSV", records[visible].to_csv(index=False).encode("utf-8"),
+                           "geoether_sensor_records.csv", "text/csv", use_container_width=True)
+    with c2:
+        st.markdown(f'<div class="muted" style="padding:.55rem 0">Showing {len(records):,} of {len(data):,} records · '
+                    f'scanned {blob_count} JSON blobs</div>', unsafe_allow_html=True)
+
+st.markdown('<div class="muted" style="text-align:center;padding:1.5rem 0">GeoEther · live telemetry monitoring · refreshes every 60 seconds</div>',
+            unsafe_allow_html=True)
